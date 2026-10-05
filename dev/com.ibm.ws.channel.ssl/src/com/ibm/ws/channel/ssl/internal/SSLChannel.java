@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 1997, 2018 IBM Corporation and others.
+ * Copyright (c) 1997, 2026 IBM Corporation and others.
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License 2.0
  * which accompanies this distribution, and is available at
@@ -12,14 +12,18 @@
  *******************************************************************************/
 package com.ibm.ws.channel.ssl.internal;
 
+import java.lang.ref.WeakReference;
 import java.net.InetSocketAddress;
 import java.security.AccessController;
 import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -27,6 +31,7 @@ import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.Status;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSessionContext;
+
 
 import com.ibm.websphere.channelfw.ChainData;
 import com.ibm.websphere.channelfw.ChannelData;
@@ -38,6 +43,7 @@ import com.ibm.websphere.ssl.JSSEHelper;
 import com.ibm.websphere.ssl.JSSEProvider;
 import com.ibm.websphere.ssl.SSLConfig;
 import com.ibm.ws.ffdc.FFDCFilter;
+import com.ibm.ws.ssl.provider.AbstractJSSEProvider;
 import com.ibm.wsspi.bytebuffer.WsByteBuffer;
 import com.ibm.wsspi.channelfw.Channel;
 import com.ibm.wsspi.channelfw.ConnectionLink;
@@ -103,6 +109,16 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
     volatile private boolean stop0Called = false;
 
     /**
+     * Registry of live inbound {@link SSLConnectionLink} instances for this channel.
+     * Used by {@link #closeAllActiveConnections()} to tear down existing connections
+     * when trust material is reloaded (e.g., a client cert is removed from the truststore).
+     * WeakReferences are used so that links that have already been GC'd do not prevent
+     * collection; dead references are pruned on each sweep.
+     */
+    private final CopyOnWriteArrayList<WeakReference<SSLConnectionLink>> activeLinkRegistry =
+        new CopyOnWriteArrayList<WeakReference<SSLConnectionLink>>();
+
+    /**
      * Constructor.
      *
      * @param inputData Input channel configuration information
@@ -125,6 +141,17 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
             ce.suppressFFDC(true);
             throw ce;
         }
+
+        // Register the active-link closer callback with the trust-manager bridge so that
+        // WSX509TrustManager.refreshTrustManagers() can close live connections after a
+        // truststore reload without a circular OSGi bundle dependency.
+        final SSLChannel self = this;
+        AbstractJSSEProvider.registerActiveLinkCloser(new Runnable() {
+            @Override
+            public void run() {
+                self.closeAllActiveConnections();
+            }
+        });
 
         // TODO z/os
         // PlatformHelper osHelper = PlatformHelperFactory.getPlatformHelper();
@@ -1016,10 +1043,82 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
         this.sessionContext = context;
         context.setSessionCacheSize(getConfig().getSSLSessionCacheSize());
         context.setSessionTimeout(getConfig().getSSLSessionTimeout());
+        // Register the session context so that a truststore reload can invalidate
+        // all cached sessions, forcing fresh TLS handshakes against the new trust material.
+        AbstractJSSEProvider.registerSSLSessionContext(context);
         if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
             Tr.debug(tc, "Session cache size set to " + context.getSessionCacheSize());
             Tr.debug(tc, "Session timeout set to " + context.getSessionTimeout());
         }
+    }
+
+    /**
+     * Adds a live inbound connection link to the active registry so that it can
+     * be closed if trust material changes while the connection is open.
+     * Called by {@link SSLConnectionLink} immediately after a successful handshake.
+     *
+     * @param link the newly-handshaked connection link; must not be {@code null}
+     */
+    void registerActiveLink(SSLConnectionLink link) {
+        activeLinkRegistry.add(new WeakReference<SSLConnectionLink>(link));
+    }
+
+    /**
+     * Removes a connection link from the active registry.  Called when the link
+     * is closed or destroyed so that the registry does not accumulate stale entries
+     * faster than they are swept during a truststore reload.
+     *
+     * @param link the connection link being closed; must not be {@code null}
+     */
+    void deregisterActiveLink(SSLConnectionLink link) {
+        List<WeakReference<SSLConnectionLink>> toRemove = new ArrayList<WeakReference<SSLConnectionLink>>();
+        for (WeakReference<SSLConnectionLink> ref : activeLinkRegistry) {
+            SSLConnectionLink candidate = ref.get();
+            if (candidate == null || candidate == link) {
+                toRemove.add(ref);
+            }
+        }
+        activeLinkRegistry.removeAll(toRemove);
+    }
+
+    /**
+     * Closes all live inbound SSL connections tracked by this channel.
+     * Called by the active-link closer callback (registered in
+     * {@link #SSLChannel(ChannelData, SSLChannelFactoryImpl)}) when
+     * {@link AbstractJSSEProvider#closeAllActiveSSLConnections()} fires after
+     * a truststore reload.
+     *
+     * <p>Each connection is closed by calling
+     * {@link SSLConnectionLink#close(com.ibm.wsspi.channelfw.VirtualConnection, Exception)}
+     * on the device link, which tears down the underlying TCP connection and
+     * forces the remote peer to reconnect — at which point the new TLS handshake
+     * will be evaluated against the refreshed trust material.
+     */
+    void closeAllActiveConnections() {
+        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+            Tr.debug(tc, "closeAllActiveConnections: sweeping " + activeLinkRegistry.size() + " registered link(s)");
+        }
+        List<WeakReference<SSLConnectionLink>> dead = new ArrayList<WeakReference<SSLConnectionLink>>();
+        SSLException cause = new SSLException("Trust material reloaded - connection closed for re-authentication");
+        for (WeakReference<SSLConnectionLink> ref : activeLinkRegistry) {
+            SSLConnectionLink link = ref.get();
+            if (link == null) {
+                dead.add(ref);
+                continue;
+            }
+            try {
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                    Tr.debug(tc, "closeAllActiveConnections: closing link " + link);
+                }
+                link.close(link.getVirtualConnection(), cause);
+            } catch (Exception ex) {
+                // Best-effort: log and continue so remaining links are still closed.
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                    Tr.debug(tc, "closeAllActiveConnections: error closing link " + link + "; " + ex);
+                }
+            }
+        }
+        activeLinkRegistry.removeAll(dead);
     }
 
     /**

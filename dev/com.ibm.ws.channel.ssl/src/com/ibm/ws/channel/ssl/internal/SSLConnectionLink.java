@@ -15,9 +15,13 @@
 package com.ibm.ws.channel.ssl.internal;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.net.InetAddress;
 import java.nio.ReadOnlyBufferException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -183,6 +187,10 @@ public class SSLConnectionLink extends OutboundProtocolLink implements Connectio
         // This is a protective measure.
         closed = true;
 
+        // Deregister from the active-link registry so this link is not targeted by
+        // a concurrent closeAllActiveConnections() sweep after it is already closed.
+        this.sslChannel.deregisterActiveLink(this);
+
         // Clean up the read and write interfaces as well as the SSL engine.
 
         // cleanup has logic to avoid writing if stop(0) has been called
@@ -210,6 +218,9 @@ public class SSLConnectionLink extends OutboundProtocolLink implements Connectio
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled()) {
             Tr.entry(tc, "destroy, vc=" + getVCHash());
         }
+
+        // Deregister from the active-link registry on destroy as well.
+        this.sslChannel.deregisterActiveLink(this);
 
         // Clean up the read and write interfaces as well as the SSL engine.
         this.connected = false;
@@ -743,6 +754,9 @@ public class SSLConnectionLink extends OutboundProtocolLink implements Connectio
 
             // PK16095 - take certain actions when the handshake completes
             getChannel().onHandshakeFinish(getSSLEngine());
+            // Register this link so closeAllActiveConnections() can tear it down
+            // if the truststore is reloaded while this connection is live.
+            getChannel().registerActiveLink(this);
 
             // Handshake complete. Now get the request. Use our read interface so unwrap already done.
             // Check if data exists in the network buffer still. This would be app data beyond handshake.

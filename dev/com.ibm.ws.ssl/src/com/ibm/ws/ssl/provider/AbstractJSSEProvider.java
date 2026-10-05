@@ -1076,6 +1076,64 @@ public abstract class AbstractJSSEProvider implements JSSEProvider {
         }
     }
 
+    /**
+     * Registers an {@link javax.net.ssl.SSLSessionContext} with the
+     * {@link WSX509TrustManager} session invalidation registry.  Calling this
+     * after each completed TLS handshake allows the SSL infrastructure to
+     * invalidate all cached sessions whenever trust material is reloaded, forcing
+     * affected connections to re-authenticate on the next request.
+     *
+     * <p>This method is a thin bridge that exposes the functionality from the
+     * private {@code com.ibm.ws.ssl.core} package through the exported
+     * {@code com.ibm.ws.ssl.provider} package so that the SSL channel bundle
+     * (which imports this package) can call it without a circular dependency.
+     *
+     * @param context the session context to register; silently ignored if {@code null}
+     */
+    public static void registerSSLSessionContext(javax.net.ssl.SSLSessionContext context) {
+        WSX509TrustManager.registerSessionContext(context);
+    }
+
+    /**
+     * Registry of per-channel active-link closers.  Each {@link com.ibm.ws.channel.ssl.internal.SSLChannel}
+     * registers a {@link Runnable} at construction time that, when invoked, closes all
+     * live inbound connections tracked by that channel instance.  A {@link java.util.concurrent.CopyOnWriteArrayList}
+     * is used so that registration (rare) and invocation (rare) are safe without
+     * holding a lock on the TLS handshake hot path.
+     */
+    private static final java.util.concurrent.CopyOnWriteArrayList<Runnable> ACTIVE_LINK_CLOSERS =
+        new java.util.concurrent.CopyOnWriteArrayList<Runnable>();
+
+    /**
+     * Registers a callback that closes all live inbound SSL connections for one
+     * {@code SSLChannel} instance.  Called once per channel at construction time so
+     * that {@link WSX509TrustManager} can trigger connection teardown after a
+     * truststore reload without a circular OSGi bundle dependency.
+     *
+     * <p>Multiple channels may be registered (e.g. one per listening endpoint);
+     * {@link #closeAllActiveSSLConnections()} invokes all of them.
+     *
+     * @param closer a {@link Runnable} whose {@code run()} iterates all live
+     *               {@link com.ibm.ws.channel.ssl.internal.SSLConnectionLink} instances
+     *               and closes them; must not be {@code null}
+     */
+    public static void registerActiveLinkCloser(Runnable closer) {
+        ACTIVE_LINK_CLOSERS.add(closer);
+    }
+
+    /**
+     * Closes all currently active inbound SSL connections across every registered
+     * {@code SSLChannel}.  Called by {@link WSX509TrustManager#refreshTrustManagers}
+     * after a truststore reload so that live connections whose peer certificate is
+     * no longer trusted are forcibly dropped, requiring the peer to reconnect and
+     * perform a fresh TLS handshake against the updated trust material.
+     */
+    public static void closeAllActiveSSLConnections() {
+        for (Runnable closer : ACTIVE_LINK_CLOSERS) {
+            closer.run();
+        }
+    }
+
     private void setOutboundConnectionInfoInternal(Map<String, Object> connectionInfo) {
         Map<String, Object> outbound = null;
         if (connectionInfo != null) {
