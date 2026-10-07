@@ -1095,42 +1095,58 @@ public abstract class AbstractJSSEProvider implements JSSEProvider {
     }
 
     /**
-     * Registry of per-channel active-link closers.  Each {@link com.ibm.ws.channel.ssl.internal.SSLChannel}
-     * registers a {@link Runnable} at construction time that, when invoked, closes all
-     * live inbound connections tracked by that channel instance.  A {@link java.util.concurrent.CopyOnWriteArrayList}
-     * is used so that registration (rare) and invocation (rare) are safe without
-     * holding a lock on the TLS handshake hot path.
+     * Functional interface for per-channel active-link closers.  Accepts the array of
+     * freshly-reloaded {@link javax.net.ssl.X509TrustManager} instances so that each
+     * channel can evaluate peer certificates against the new trust material and close
+     * only the connections that are no longer trusted.
      */
-    private static final java.util.concurrent.CopyOnWriteArrayList<Runnable> ACTIVE_LINK_CLOSERS =
-        new java.util.concurrent.CopyOnWriteArrayList<Runnable>();
+    public interface TrustAwareCloser {
+        /**
+         * Close all inbound connections on one {@code SSLChannel} whose peer certificate
+         * chain is no longer valid under the supplied trust managers.
+         *
+         * @param managers the trust managers reloaded after a truststore file change;
+         *                 never {@code null}
+         */
+        void closeUntrusted(javax.net.ssl.X509TrustManager[] managers);
+    }
 
     /**
-     * Registers a callback that closes all live inbound SSL connections for one
-     * {@code SSLChannel} instance.  Called once per channel at construction time so
-     * that {@link WSX509TrustManager} can trigger connection teardown after a
-     * truststore reload without a circular OSGi bundle dependency.
-     *
-     * <p>Multiple channels may be registered (e.g. one per listening endpoint);
-     * {@link #closeAllActiveSSLConnections()} invokes all of them.
-     *
-     * @param closer a {@link Runnable} whose {@code run()} iterates all live
-     *               {@link com.ibm.ws.channel.ssl.internal.SSLConnectionLink} instances
-     *               and closes them; must not be {@code null}
+     * Registry of per-channel active-link closers.  Each {@link com.ibm.ws.channel.ssl.internal.SSLChannel}
+     * registers a {@link TrustAwareCloser} at construction time.  A
+     * {@link java.util.concurrent.CopyOnWriteArrayList} is used so that registration
+     * (rare) and invocation (rare) are safe without holding a lock on the handshake
+     * hot path.
      */
-    public static void registerActiveLinkCloser(Runnable closer) {
+    private static final java.util.concurrent.CopyOnWriteArrayList<TrustAwareCloser> ACTIVE_LINK_CLOSERS =
+        new java.util.concurrent.CopyOnWriteArrayList<TrustAwareCloser>();
+
+    /**
+     * Registers a trust-aware closer for one {@code SSLChannel} instance.  Called once
+     * per channel at construction time so that {@link WSX509TrustManager} can selectively
+     * close live connections after a truststore reload without a circular OSGi bundle
+     * dependency.
+     *
+     * @param closer a {@link TrustAwareCloser} that evaluates peer certificates against
+     *               the supplied trust managers and closes only untrusted connections;
+     *               must not be {@code null}
+     */
+    public static void registerActiveLinkCloser(TrustAwareCloser closer) {
         ACTIVE_LINK_CLOSERS.add(closer);
     }
 
     /**
-     * Closes all currently active inbound SSL connections across every registered
-     * {@code SSLChannel}.  Called by {@link WSX509TrustManager#refreshTrustManagers}
-     * after a truststore reload so that live connections whose peer certificate is
-     * no longer trusted are forcibly dropped, requiring the peer to reconnect and
-     * perform a fresh TLS handshake against the updated trust material.
+     * Selectively closes live inbound SSL connections across every registered
+     * {@code SSLChannel} whose peer certificate chain is no longer trusted under the
+     * supplied managers.  Called by {@link WSX509TrustManager#refreshTrustManagers}
+     * after a truststore reload.
+     *
+     * @param managers the trust managers that have just been reloaded; must not be
+     *                 {@code null}
      */
-    public static void closeAllActiveSSLConnections() {
-        for (Runnable closer : ACTIVE_LINK_CLOSERS) {
-            closer.run();
+    public static void closeUntrustedActiveSSLConnections(javax.net.ssl.X509TrustManager[] managers) {
+        for (TrustAwareCloser closer : ACTIVE_LINK_CLOSERS) {
+            closer.closeUntrusted(managers);
         }
     }
 

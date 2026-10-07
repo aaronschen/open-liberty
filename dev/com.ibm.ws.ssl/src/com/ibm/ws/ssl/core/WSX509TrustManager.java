@@ -272,6 +272,10 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled())
             Tr.entry(tc, "refreshTrustManagers", trustStoreFilePath);
 
+        // Reload trust material and collect the live managers for this path.
+        // refreshInPlace() must complete before the connection sweep below so that
+        // any checkClientTrusted() calls evaluate against the new trust material.
+        List<javax.net.ssl.X509TrustManager> refreshed = new ArrayList<javax.net.ssl.X509TrustManager>();
         CopyOnWriteArrayList<WeakReference<WSX509TrustManager>> refs = REGISTRY.get(trustStoreFilePath);
         if (refs != null) {
             List<WeakReference<WSX509TrustManager>> dead = new ArrayList<WeakReference<WSX509TrustManager>>();
@@ -282,6 +286,7 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
                     continue;
                 }
                 mgr.refreshInPlace();
+                refreshed.add(mgr);
             }
             refs.removeAll(dead);
         } else {
@@ -295,13 +300,17 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         // without re-authentication, even when no new handshakes have occurred yet.
         invalidateAllCachedSessions();
 
-        // Close all currently active inbound SSL connections.  Cached-session
-        // invalidation (above) handles the resumption cache for *future* connections;
-        // this handles connections that are *live right now* — their SSLSession is
-        // held directly on the SSLEngine and will never appear in SSLSessionContext.getIds().
-        // Closing the connection forces the remote peer to reconnect and perform a fresh
-        // TLS handshake against the updated trust material.
-        AbstractJSSEProvider.closeAllActiveSSLConnections();
+        // Selectively close only those live inbound connections whose peer certificate
+        // chain is no longer trusted under the reloaded trust managers.  Each connection
+        // link's peer cert chain (retained in the SSLSession from the original handshake)
+        // is re-evaluated via checkClientTrusted(); only failing connections are closed.
+        // If no managers were registered for this path (e.g. reload happened before any
+        // connection was established) there is nothing to evaluate and no connections to close.
+        if (!refreshed.isEmpty()) {
+            javax.net.ssl.X509TrustManager[] managers =
+                refreshed.toArray(new javax.net.ssl.X509TrustManager[0]);
+            AbstractJSSEProvider.closeUntrustedActiveSSLConnections(managers);
+        }
 
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled())
             Tr.exit(tc, "refreshTrustManagers");

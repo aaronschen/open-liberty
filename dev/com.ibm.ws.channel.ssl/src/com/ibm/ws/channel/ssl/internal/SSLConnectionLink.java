@@ -18,6 +18,10 @@ import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.net.InetAddress;
 import java.nio.ReadOnlyBufferException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +34,7 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLPeerUnverifiedException;
 
 import com.ibm.websphere.channelfw.FlowType;
 import com.ibm.websphere.channelfw.osgi.CHFWBundle;
@@ -1217,6 +1222,46 @@ public class SSLConnectionLink extends OutboundProtocolLink implements Connectio
      */
     public SSLEngine getSSLEngine() {
         return this.sslEngine;
+    }
+
+    /**
+     * Returns the peer certificate chain that was presented during the TLS handshake
+     * for this connection, as an array of {@link X509Certificate}.
+     *
+     * <p>The certificates are retrieved from the live {@link javax.net.ssl.SSLSession}
+     * held by the {@link SSLEngine} — they reflect the peer's identity as established
+     * at handshake time and remain available for the lifetime of the connection.
+     *
+     * @return the peer's certificate chain; never {@code null} or empty
+     * @throws SSLPeerUnverifiedException if the peer did not present a certificate
+     *         (e.g. anonymous TLS) or if the engine has no active session
+     */
+    X509Certificate[] getPeerCertificates() throws SSLPeerUnverifiedException {
+        final SSLEngine engine = this.sslEngine;
+        if (engine == null) {
+            throw new SSLPeerUnverifiedException("SSLEngine is null — connection may already be closed");
+        }
+        Certificate[] certs = AccessController.doPrivileged(new PrivilegedAction<Certificate[]>() {
+            @Override
+            public Certificate[] run() {
+                try {
+                    return engine.getSession().getPeerCertificates();
+                } catch (SSLPeerUnverifiedException e) {
+                    return null;
+                }
+            }
+        });
+        if (certs == null) {
+            throw new SSLPeerUnverifiedException("Peer did not present a certificate chain");
+        }
+        X509Certificate[] x509 = new X509Certificate[certs.length];
+        for (int i = 0; i < certs.length; i++) {
+            if (!(certs[i] instanceof X509Certificate)) {
+                throw new SSLPeerUnverifiedException("Peer certificate is not an X509Certificate: " + certs[i].getType());
+            }
+            x509[i] = (X509Certificate) certs[i];
+        }
+        return x509;
     }
 
     /**
