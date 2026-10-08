@@ -26,6 +26,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
+import javax.net.ssl.X509TrustManager;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -152,8 +153,8 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
         final SSLChannel self = this;
         AbstractJSSEProvider.registerActiveLinkCloser(new AbstractJSSEProvider.TrustAwareCloser() {
             @Override
-            public void closeUntrusted(X509TrustManager[] managers) {
-                self.closeUntrustedConnections(managers);
+            public void closeUntrusted(Map<String, X509TrustManager> managersByAlias) {
+                self.closeUntrustedConnections(managersByAlias);
             }
         });
 
@@ -1087,21 +1088,28 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
 
     /**
      * Closes only those live inbound connections whose peer certificate chain is no
-     * longer trusted under the supplied trust managers.  Called by the
+     * longer trusted under the trust manager that governs them.  Called by the
      * {@link AbstractJSSEProvider.TrustAwareCloser} registered in
      * {@link #SSLChannel(ChannelData, SSLChannelFactoryImpl)} when
      * {@link AbstractJSSEProvider#closeUntrustedActiveSSLConnections} fires after a
      * truststore reload.
      *
-     * <p>For each live {@link SSLConnectionLink} the peer certificate chain is
-     * extracted from the active {@link javax.net.ssl.SSLSession} and re-evaluated
-     * against every supplied trust manager.  The connection is closed only if at
-     * least one manager rejects the chain.  Connections whose certificates are still
-     * trusted are left untouched.
+     * <p>For each live {@link SSLConnectionLink} the SSL config alias stored in its
+     * {@link SSLLinkConfig} is used to look up the specific {@link X509TrustManager}
+     * that governed the original handshake.  The peer certificate chain retained in the
+     * active {@link javax.net.ssl.SSLSession} is re-evaluated against that manager via
+     * {@code checkClientTrusted()}.  Only connections that fail are closed; connections
+     * whose certificates are still trusted under their governing SSL config are left
+     * untouched.
      *
-     * @param managers the freshly-reloaded trust managers; must not be {@code null}
+     * <p>If no manager is found for a link's SSL config alias (e.g. the link was
+     * established under a config that references a different truststore), the link is
+     * skipped — the truststore that changed is not the one governing that connection.
+     *
+     * @param managersByAlias map from SSL config alias to the reloaded trust manager for
+     *                        that alias; must not be {@code null}
      */
-    void closeUntrustedConnections(X509TrustManager[] managers) {
+    void closeUntrustedConnections(Map<String, X509TrustManager> managersByAlias) {
         if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
             Tr.debug(tc, "closeUntrustedConnections: sweeping " + activeLinkRegistry.size() + " registered link(s)");
         }
@@ -1114,18 +1122,30 @@ public class SSLChannel implements InboundChannel, OutboundChannel, Discriminato
                 continue;
             }
             try {
+                // Look up the trust manager that governed this connection's handshake.
+                SSLLinkConfig linkCfg = link.getLinkConfig();
+                String sslAlias = (linkCfg != null) ? linkCfg.getProperty(com.ibm.websphere.ssl.Constants.SSLPROP_ALIAS) : null;
+                X509TrustManager manager = (sslAlias != null) ? managersByAlias.get(sslAlias) : null;
+                if (manager == null) {
+                    // This connection's SSL config references a different truststore — skip it.
+                    if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                        Tr.debug(tc, "closeUntrustedConnections: no manager for alias '" + sslAlias + "' — skipping link " + link);
+                    }
+                    continue;
+                }
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                    Tr.debug(tc, "closeUntrustedConnections: resolved manager for alias '" + sslAlias + "' on link " + link);
+                }
+
                 X509Certificate[] peerCerts = link.getPeerCertificates();
                 String authType = peerCerts[0].getPublicKey().getAlgorithm();
                 boolean trusted = true;
-                for (X509TrustManager manager : managers) {
-                    try {
-                        manager.checkClientTrusted(peerCerts, authType);
-                    } catch (CertificateException ce) {
-                        trusted = false;
-                        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
-                            Tr.debug(tc, "closeUntrustedConnections: peer cert rejected by trust manager for link " + link + "; " + ce);
-                        }
-                        break;
+                try {
+                    manager.checkClientTrusted(peerCerts, authType);
+                } catch (CertificateException ce) {
+                    trusted = false;
+                    if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                        Tr.debug(tc, "closeUntrustedConnections: peer cert rejected by trust manager for link " + link + "; " + ce);
                     }
                 }
                 if (!trusted) {

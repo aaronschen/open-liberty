@@ -1095,20 +1095,20 @@ public abstract class AbstractJSSEProvider implements JSSEProvider {
     }
 
     /**
-     * Functional interface for per-channel active-link closers.  Accepts the array of
-     * freshly-reloaded {@link javax.net.ssl.X509TrustManager} instances so that each
-     * channel can evaluate peer certificates against the new trust material and close
-     * only the connections that are no longer trusted.
+     * Functional interface for per-channel active-link closers.  Accepts a map of
+     * SSL-config-alias → freshly-reloaded {@link javax.net.ssl.X509TrustManager} so
+     * that each channel can look up the exact trust manager that governs each live
+     * connection and close only the connections that are no longer trusted.
      */
     public interface TrustAwareCloser {
         /**
          * Close all inbound connections on one {@code SSLChannel} whose peer certificate
-         * chain is no longer valid under the supplied trust managers.
+         * chain is no longer valid under the trust manager that governs them.
          *
-         * @param managers the trust managers reloaded after a truststore file change;
-         *                 never {@code null}
+         * @param managersByAlias map from SSL config alias to the reloaded trust manager
+         *                        for that alias; never {@code null}
          */
-        void closeUntrusted(javax.net.ssl.X509TrustManager[] managers);
+        void closeUntrusted(java.util.Map<String, javax.net.ssl.X509TrustManager> managersByAlias);
     }
 
     /**
@@ -1127,9 +1127,9 @@ public abstract class AbstractJSSEProvider implements JSSEProvider {
      * close live connections after a truststore reload without a circular OSGi bundle
      * dependency.
      *
-     * @param closer a {@link TrustAwareCloser} that evaluates peer certificates against
-     *               the supplied trust managers and closes only untrusted connections;
-     *               must not be {@code null}
+     * @param closer a {@link TrustAwareCloser} that looks up the governing trust manager
+     *               by SSL config alias and closes only untrusted connections; must not
+     *               be {@code null}
      */
     public static void registerActiveLinkCloser(TrustAwareCloser closer) {
         ACTIVE_LINK_CLOSERS.add(closer);
@@ -1138,15 +1138,15 @@ public abstract class AbstractJSSEProvider implements JSSEProvider {
     /**
      * Selectively closes live inbound SSL connections across every registered
      * {@code SSLChannel} whose peer certificate chain is no longer trusted under the
-     * supplied managers.  Called by {@link WSX509TrustManager#refreshTrustManagers}
+     * manager that governs them.  Called by {@link WSX509TrustManager#refreshTrustManagers}
      * after a truststore reload.
      *
-     * @param managers the trust managers that have just been reloaded; must not be
-     *                 {@code null}
+     * @param managersByAlias map from SSL config alias to the reloaded trust manager for
+     *                        that alias; must not be {@code null}
      */
-    public static void closeUntrustedActiveSSLConnections(javax.net.ssl.X509TrustManager[] managers) {
+    public static void closeUntrustedActiveSSLConnections(java.util.Map<String, javax.net.ssl.X509TrustManager> managersByAlias) {
         for (TrustAwareCloser closer : ACTIVE_LINK_CLOSERS) {
-            closer.closeUntrusted(managers);
+            closer.closeUntrusted(managersByAlias);
         }
     }
 

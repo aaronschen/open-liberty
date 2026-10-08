@@ -93,6 +93,8 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
     private volatile TrustManager[] tm;
     private final String tsCfgAlias;
     private final String tsFile;
+    /** The SSL config alias (e.g. "defaultSSLConfig") that owns this trust manager. */
+    private final String sslCfgAlias;
     private Map<String, Object> extendedInfo;
     private String peerHost;
     private final SSLConfig config;
@@ -129,6 +131,7 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         this.config = null;
         this.tsCfgAlias = null;
         this.tsFile = null;
+        this.sslCfgAlias = null;
         this.tm = tmArray.clone();
         this.autoAccept = false;
         this.useCACertFile = useCacerts;
@@ -153,6 +156,7 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         tm = tmArray.clone();
         tsFile = trustStoreFilename;
         tsCfgAlias = trustStoreAlias;
+        sslCfgAlias = sslConfig.getProperty(Constants.SSLPROP_ALIAS);
         config = sslConfig;
         extendedInfo = connectionInfo;
         isServer = SSLConfigManager.getInstance().isServerProcess();
@@ -199,6 +203,23 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         if (tsFile == null)
             return;
         REGISTRY.computeIfAbsent(tsFile, k -> new CopyOnWriteArrayList<WeakReference<WSX509TrustManager>>()).add(new WeakReference<WSX509TrustManager>(this));
+    }
+
+    /**
+     * Returns the SSL configuration alias (e.g. {@code "defaultSSLConfig"}) of the
+     * {@code <ssl>} element that owns this trust manager, or {@code null} if this
+     * instance was created outside of a full server SSL configuration (e.g. in a
+     * unit test).
+     *
+     * <p>This alias matches the value of {@link com.ibm.websphere.ssl.Constants#SSLPROP_ALIAS}
+     * in the SSL config properties and corresponds to the {@code id} attribute of the
+     * {@code <ssl>} element in {@code server.xml}.  It can be used to match a trust
+     * manager to the connection link that was established under the same SSL config.
+     *
+     * @return the SSL config alias, or {@code null}
+     */
+    public String getSSLConfigAlias() {
+        return sslCfgAlias;
     }
 
     /**
@@ -272,10 +293,14 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled())
             Tr.entry(tc, "refreshTrustManagers", trustStoreFilePath);
 
-        // Reload trust material and collect the live managers for this path.
+        // Reload trust material and build a map of SSL-config-alias → trust manager.
         // refreshInPlace() must complete before the connection sweep below so that
         // any checkClientTrusted() calls evaluate against the new trust material.
-        List<javax.net.ssl.X509TrustManager> refreshed = new ArrayList<javax.net.ssl.X509TrustManager>();
+        // The map allows closeUntrustedConnections() to look up the exact trust manager
+        // that governs each live connection by its SSL config alias, rather than checking
+        // all managers regardless of which SSL config the connection was established under.
+        java.util.Map<String, javax.net.ssl.X509TrustManager> refreshed =
+            new java.util.HashMap<String, javax.net.ssl.X509TrustManager>();
         CopyOnWriteArrayList<WeakReference<WSX509TrustManager>> refs = REGISTRY.get(trustStoreFilePath);
         if (refs != null) {
             List<WeakReference<WSX509TrustManager>> dead = new ArrayList<WeakReference<WSX509TrustManager>>();
@@ -286,7 +311,10 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
                     continue;
                 }
                 mgr.refreshInPlace();
-                refreshed.add(mgr);
+                String alias = mgr.getSSLConfigAlias();
+                if (alias != null) {
+                    refreshed.put(alias, mgr);
+                }
             }
             refs.removeAll(dead);
         } else {
@@ -301,15 +329,14 @@ public final class WSX509TrustManager extends X509ExtendedTrustManager {
         invalidateAllCachedSessions();
 
         // Selectively close only those live inbound connections whose peer certificate
-        // chain is no longer trusted under the reloaded trust managers.  Each connection
-        // link's peer cert chain (retained in the SSLSession from the original handshake)
-        // is re-evaluated via checkClientTrusted(); only failing connections are closed.
-        // If no managers were registered for this path (e.g. reload happened before any
-        // connection was established) there is nothing to evaluate and no connections to close.
+        // chain is no longer trusted under the reloaded trust manager for their SSL config.
+        // Each connection link's peer cert chain (retained in the SSLSession from the
+        // original handshake) is re-evaluated via checkClientTrusted(); only failing
+        // connections are closed.  If no managers were registered for this path (e.g.
+        // reload happened before any connection was established) the map is empty and
+        // the sweep is skipped.
         if (!refreshed.isEmpty()) {
-            javax.net.ssl.X509TrustManager[] managers =
-                refreshed.toArray(new javax.net.ssl.X509TrustManager[0]);
-            AbstractJSSEProvider.closeUntrustedActiveSSLConnections(managers);
+            AbstractJSSEProvider.closeUntrustedActiveSSLConnections(refreshed);
         }
 
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled())
